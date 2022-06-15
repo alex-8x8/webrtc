@@ -11,7 +11,6 @@
 #import "RTCAudioSession+Private.h"
 
 #import <UIKit/UIKit.h>
-
 #include <vector>
 
 #include "rtc_base/atomic_ops.h"
@@ -27,9 +26,9 @@ NSInteger const kRTCAudioSessionErrorLockRequired = -1;
 NSInteger const kRTCAudioSessionErrorConfiguration = -2;
 NSString * const kRTCAudioSessionOutputVolumeSelector = @"outputVolume";
 
-@interface RTC_OBJC_TYPE (RTCAudioSession)
-() @property(nonatomic,
-             readonly) std::vector<__weak id<RTC_OBJC_TYPE(RTCAudioSessionDelegate)> > delegates;
+@interface RTC_OBJC_TYPE (RTCAudioSession)()
+@property(nonatomic, readonly) std::vector<__weak id<RTC_OBJC_TYPE(RTCAudioSessionDelegate)> > delegates;
+@property (nonatomic, strong) dispatch_block_t pendingAudioRestart;
 @end
 
 // This class needs to be thread-safe because it is accessed from many threads.
@@ -70,24 +69,25 @@ NSString * const kRTCAudioSessionOutputVolumeSelector = @"outputVolume";
 - (instancetype)initWithAudioSession:(id)audioSession {
   if (self = [super init]) {
     _session = audioSession;
-
+    _useManualAudio = TRUE;
+      
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
     [center addObserver:self
                selector:@selector(handleInterruptionNotification:)
                    name:AVAudioSessionInterruptionNotification
-                 object:nil];
+                 object:_session.native];
     [center addObserver:self
                selector:@selector(handleRouteChangeNotification:)
                    name:AVAudioSessionRouteChangeNotification
-                 object:nil];
+                 object:_session.native];
     [center addObserver:self
                selector:@selector(handleMediaServicesWereLost:)
                    name:AVAudioSessionMediaServicesWereLostNotification
-                 object:nil];
+                 object:_session.native];
     [center addObserver:self
                selector:@selector(handleMediaServicesWereReset:)
                    name:AVAudioSessionMediaServicesWereResetNotification
-                 object:nil];
+                 object:_session.native];
     // Posted on the main thread when the primary audio from other applications
     // starts and stops. Foreground applications may use this notification as a
     // hint to enable or disable audio that is secondary.
@@ -140,26 +140,14 @@ NSString * const kRTCAudioSessionOutputVolumeSelector = @"outputVolume";
   return description;
 }
 
-- (void)setIsActive:(BOOL)isActive {
-  @synchronized(self) {
-    _isActive = isActive;
-  }
-}
-
 - (BOOL)isActive {
   @synchronized(self) {
-    return _isActive;
+    return _activationCount > 0;
   }
 }
 
 - (void)setUseManualAudio:(BOOL)useManualAudio {
-  @synchronized(self) {
-    if (_useManualAudio == useManualAudio) {
-      return;
-    }
-    _useManualAudio = useManualAudio;
-  }
-  [self updateCanPlayOrRecord];
+    // mode is fixed
 }
 
 - (BOOL)useManualAudio {
@@ -336,59 +324,8 @@ NSString * const kRTCAudioSessionOutputVolumeSelector = @"outputVolume";
 
 - (BOOL)setActive:(BOOL)active
             error:(NSError **)outError {
-  int activationCount = _activationCount;
-  if (!active && activationCount == 0) {
-    RTCLogWarning(@"Attempting to deactivate without prior activation.");
-  }
-  [self notifyWillSetActive:active];
-  BOOL success = YES;
-  BOOL isActive = self.isActive;
-  // Keep a local error so we can log it.
-  NSError *error = nil;
-  BOOL shouldSetActive =
-      (active && !isActive) || (!active && isActive && activationCount == 1);
-  // Attempt to activate if we're not active.
-  // Attempt to deactivate if we're active and it's the last unbalanced call.
-  if (shouldSetActive) {
-    // AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation is used to ensure
-    // that other audio sessions that were interrupted by our session can return
-    // to their active state. It is recommended for VoIP apps to use this
-    // option.
-    AVAudioSessionSetActiveOptions options =
-        active ? 0 : AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation;
-    success = [self.session setActive:active
-                          withOptions:options
-                                error:&error];
-    if (outError) {
-      *outError = error;
-    }
-  }
-  if (success) {
-    if (active) {
-      if (shouldSetActive) {
-        self.isActive = active;
-        if (self.isInterrupted) {
-          self.isInterrupted = NO;
-          [self notifyDidEndInterruptionWithShouldResumeSession:YES];
-        }
-      }
-      [self incrementActivationCount];
-      [self notifyDidSetActive:active];
-    }
-  } else {
-    RTCLogError(@"Failed to setActive:%d. Error: %@",
-                active, error.localizedDescription);
-    [self notifyFailedToSetActive:active error:error];
-  }
-  // Set isActive and decrement activation count on deactivation
-  // whether or not it succeeded.
-  if (!active) {
-    self.isActive = active;
-    [self notifyDidSetActive:active];
-    [self decrementActivationCount];
-  }
-  RTCLog(@"Number of current activations: %d", _activationCount);
-  return success;
+    RTCLogWarning(@"ignore attempt to activate audio session (manual mode is on).");
+    return YES;
 }
 
 - (BOOL)setCategory:(NSString *)category
@@ -446,30 +383,31 @@ NSString * const kRTCAudioSessionOutputVolumeSelector = @"outputVolume";
 #pragma mark - Notifications
 
 - (void)handleInterruptionNotification:(NSNotification *)notification {
-  NSNumber* typeNumber =
-      notification.userInfo[AVAudioSessionInterruptionTypeKey];
-  AVAudioSessionInterruptionType type =
-      (AVAudioSessionInterruptionType)typeNumber.unsignedIntegerValue;
+  if (!self.isActive) {
+    RTCLog(@"Ignore interruption notification as session isn't active.");
+    return;
+  }
+  NSNumber* typeNumber = notification.userInfo[AVAudioSessionInterruptionTypeKey];
+  AVAudioSessionInterruptionType type = (AVAudioSessionInterruptionType)typeNumber.unsignedIntegerValue;
   switch (type) {
-    case AVAudioSessionInterruptionTypeBegan:
-      RTCLog(@"Audio session interruption began.");
-      self.isActive = NO;
-      self.isInterrupted = YES;
-      [self notifyDidBeginInterruption];
-      break;
+    case AVAudioSessionInterruptionTypeBegan: {
+        RTCLog(@"Audio session interruption began.");
+        UIApplicationState state = [[UIApplication sharedApplication] applicationState];
+        if (state == UIApplicationStateActive) {
+          RTCLog(@"scheduling audio restart …");
+          [self scheduleAudioRestart];
+          return;
+        }
+        self.isInterrupted = YES;
+        [self notifyDidBeginInterruption];
+        break;
+      }
     case AVAudioSessionInterruptionTypeEnded: {
-      RTCLog(@"Audio session interruption ended.");
-      self.isInterrupted = NO;
-      [self updateAudioSessionAfterEvent];
-      NSNumber *optionsNumber =
-          notification.userInfo[AVAudioSessionInterruptionOptionKey];
-      AVAudioSessionInterruptionOptions options =
-          optionsNumber.unsignedIntegerValue;
-      BOOL shouldResume =
-          options & AVAudioSessionInterruptionOptionShouldResume;
-      [self notifyDidEndInterruptionWithShouldResumeSession:shouldResume];
-      break;
-    }
+        RTCLog(@"Audio session interruption ended.");
+        self.isInterrupted = NO;
+        [self restartAudio];
+        break;
+      }
   }
 }
 
@@ -517,13 +455,11 @@ NSString * const kRTCAudioSessionOutputVolumeSelector = @"outputVolume";
 
 - (void)handleMediaServicesWereLost:(NSNotification *)notification {
   RTCLog(@"Media services were lost.");
-  [self updateAudioSessionAfterEvent];
   [self notifyMediaServicesWereLost];
 }
 
 - (void)handleMediaServicesWereReset:(NSNotification *)notification {
   RTCLog(@"Media services were reset.");
-  [self updateAudioSessionAfterEvent];
   [self notifyMediaServicesWereReset];
 }
 
@@ -546,16 +482,17 @@ NSString * const kRTCAudioSessionOutputVolumeSelector = @"outputVolume";
 }
 
 - (void)handleApplicationDidBecomeActive:(NSNotification *)notification {
+  if (!self.isActive) {
+    RTCLog(@"Ignore 'app become active' notification as session isn't active.");
+    return;
+  }
   BOOL isInterrupted = self.isInterrupted;
   RTCLog(@"Application became active after an interruption. Treating as interruption "
           "end. isInterrupted changed from %d to 0.",
          isInterrupted);
   if (isInterrupted) {
     self.isInterrupted = NO;
-    [self updateAudioSessionAfterEvent];
   }
-  // Always treat application becoming active as an interruption end event.
-  [self notifyDidEndInterruptionWithShouldResumeSession:YES];
 }
 
 #pragma mark - Private
@@ -603,7 +540,7 @@ NSString * const kRTCAudioSessionOutputVolumeSelector = @"outputVolume";
 }
 
 - (BOOL)canPlayOrRecord {
-  return !self.useManualAudio || self.isAudioEnabled;
+  return self.isAudioEnabled;
 }
 
 - (BOOL)isInterrupted {
@@ -718,26 +655,11 @@ NSString * const kRTCAudioSessionOutputVolumeSelector = @"outputVolume";
                                 userInfo:userInfo];
 }
 
-- (void)updateAudioSessionAfterEvent {
-  BOOL shouldActivate = self.activationCount > 0;
-  AVAudioSessionSetActiveOptions options = shouldActivate ?
-      0 : AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation;
-  NSError *error = nil;
-  if ([self.session setActive:shouldActivate
-                  withOptions:options
-                        error:&error]) {
-    self.isActive = shouldActivate;
-  } else {
-    RTCLogError(@"Failed to set session active to %d. Error:%@",
-                shouldActivate, error.localizedDescription);
-  }
-}
-
 - (void)updateCanPlayOrRecord {
   BOOL canPlayOrRecord = NO;
   BOOL shouldNotify = NO;
   @synchronized(self) {
-    canPlayOrRecord = !self.useManualAudio || self.isAudioEnabled;
+    canPlayOrRecord = self.isAudioEnabled;
     if (_canPlayOrRecord == canPlayOrRecord) {
       return;
     }
@@ -750,12 +672,7 @@ NSString * const kRTCAudioSessionOutputVolumeSelector = @"outputVolume";
 }
 
 - (void)audioSessionDidActivate:(AVAudioSession *)session {
-  if (self.session.native != session) {
-    RTCLogError(@"audioSessionDidActivate called on different AVAudioSession");
-  }
   RTCLog(@"Audio session was externally activated.");
-  [self incrementActivationCount];
-  self.isActive = YES;
   // When a CallKit call begins, it's possible that we receive an interruption
   // begin without a corresponding end. Since we know that we have an activated
   // audio session at this point, just clear any saved interruption flag since
@@ -764,17 +681,14 @@ NSString * const kRTCAudioSessionOutputVolumeSelector = @"outputVolume";
     RTCLog(@"Clearing interrupted state due to external activation.");
     self.isInterrupted = NO;
   }
-  // Treat external audio session activation as an end interruption event.
-  [self notifyDidEndInterruptionWithShouldResumeSession:YES];
+  [self incrementActivationCount];
+  [self startAudio];
 }
 
 - (void)audioSessionDidDeactivate:(AVAudioSession *)session {
-  if (self.session.native != session) {
-    RTCLogError(@"audioSessionDidDeactivate called on different AVAudioSession");
-  }
   RTCLog(@"Audio session was externally deactivated.");
-  self.isActive = NO;
   [self decrementActivationCount];
+  [self stopAudio];
 }
 
 - (void)observeValueForKeyPath:(NSString *)keyPath
@@ -890,31 +804,50 @@ NSString * const kRTCAudioSessionOutputVolumeSelector = @"outputVolume";
   }
 }
 
-- (void)notifyWillSetActive:(BOOL)active {
-  for (id delegate : self.delegates) {
-    SEL sel = @selector(audioSession:willSetActive:);
-    if ([delegate respondsToSelector:sel]) {
-      [delegate audioSession:self willSetActive:active];
-    }
-  }
+#pragma mark -
+
+- (void)startAudio {
+    [self cancelAudioRestart];
+    self.isAudioEnabled = TRUE;
 }
 
-- (void)notifyDidSetActive:(BOOL)active {
-  for (id delegate : self.delegates) {
-    SEL sel = @selector(audioSession:didSetActive:);
-    if ([delegate respondsToSelector:sel]) {
-      [delegate audioSession:self didSetActive:active];
-    }
-  }
+
+- (void)stopAudio {
+    [self cancelAudioRestart];
+    self.isAudioEnabled = FALSE;
 }
 
-- (void)notifyFailedToSetActive:(BOOL)active error:(NSError *)error {
-  for (id delegate : self.delegates) {
-    SEL sel = @selector(audioSession:failedToSetActive:error:);
-    if ([delegate respondsToSelector:sel]) {
-      [delegate audioSession:self failedToSetActive:active error:error];
+- (void)restartAudio {
+    [self notifyDidEndInterruptionWithShouldResumeSession:YES];
+    
+    @synchronized(self) {
+        self.pendingAudioRestart = nil;
     }
-  }
+}
+
+#pragma mark -
+
+- (void)scheduleAudioRestart {
+    @synchronized(self) {
+        __weak __typeof(self) weakSelf = self;
+        dispatch_block_t block = dispatch_block_create(static_cast<dispatch_block_flags_t>(0), ^{
+            [weakSelf restartAudio];
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue( DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+                       block);
+        self.pendingAudioRestart = block;
+    }
+}
+
+- (void)cancelAudioRestart {
+    @synchronized(self) {
+        if (self.pendingAudioRestart) {
+            RTCLog(@"canceling audio restart …");
+            dispatch_block_cancel(self.pendingAudioRestart);
+            self.pendingAudioRestart = nil;
+        }
+    }
 }
 
 @end
