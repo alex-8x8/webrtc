@@ -81,7 +81,7 @@ ABSL_CONST_INIT thread_local bool mutex_locked = false;
 - (instancetype)initWithAudioSession:(id)audioSession {
   if (self = [super init]) {
     _session = audioSession;
-    _useManualAudio = TRUE;
+    _useManualAudio = FALSE;
       
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
     [center addObserver:self
